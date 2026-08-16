@@ -127,6 +127,7 @@ const (
 	ApiRequestTypeToken               ApiRequestType = "token"
 	ApiRequestSetDeviceName           ApiRequestType = "set_device_name"
 	ApiRequestTypeReopenOutput        ApiRequestType = "reopen_output"
+	ApiRequestTypeStream              ApiRequestType = "stream"
 )
 
 type ApiEventType string
@@ -173,6 +174,23 @@ func NewApiRequest(t ApiRequestType, data any) (req ApiRequest, wait func(contex
 		}
 	}
 	return
+}
+
+// ApiStreamData is the request payload for the /player/stream endpoint. It is
+// assembled from query parameters (not a JSON body) so the generated spec
+// describes it as parameters rather than a schema.
+type ApiStreamData struct {
+	Uri     string
+	Bitrate int // 0 selects the daemon's configured bitrate
+}
+
+// ApiStreamResponse carries a decrypted audio stream back to the HTTP handler.
+// It is not JSON-encoded; PlayerStream serves it with http.ServeContent so the
+// endpoint supports range requests.
+type ApiStreamResponse struct {
+	Content     io.ReadSeeker
+	ContentType string
+	Filename    string
 }
 
 type apiResponse struct {
@@ -394,42 +412,57 @@ func (s *StubApiServer) Close() error {
 	return nil
 }
 
-func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter) {
+// dispatch hands a request to the daemon and blocks until it replies. It is
+// the half of handleRequest that does not touch the response body, so handlers
+// that write their own body (see PlayerStream) can share the request plumbing
+// and the error-to-status mapping without going through the JSON encoder.
+// It reports whether the caller should go on to write a success response; when
+// it returns false the status has already been written.
+func (s *ConcreteApiServer) dispatch(req ApiRequest, w http.ResponseWriter) (any, bool) {
 	req.resp = make(chan apiResponse, 1)
 	s.requests <- req
 	resp := <-req.resp
 
 	if resp.err != nil {
-		switch {
-		case errors.Is(resp.err, ErrNoSession):
-			w.WriteHeader(http.StatusNoContent)
-			return
-		case errors.Is(resp.err, ErrForbidden):
-			w.WriteHeader(http.StatusForbidden)
-			return
-		case errors.Is(resp.err, ErrNotFound):
-			w.WriteHeader(http.StatusNotFound)
-			return
-		case errors.Is(resp.err, ErrMethodNotAllowed):
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		case errors.Is(resp.err, ErrTooManyRequests):
-			w.WriteHeader(http.StatusTooManyRequests)
-			return
-		case errors.Is(resp.err, ErrSuperseded), errors.Is(resp.err, ErrLoaderBusy):
-			w.WriteHeader(http.StatusConflict)
-			return
-		case errors.Is(resp.err, ErrBadRequest):
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		default:
-			s.log.WithError(resp.err).Errorf("failed handling request %s", req.Type)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
+		s.writeError(req.Type, resp.err, w)
+		return nil, false
 	}
 
-	switch respData := resp.data.(type) {
+	return resp.data, true
+}
+
+// writeError maps a daemon error onto an HTTP status. Anything unrecognised is
+// a 500 and is logged, since it means the daemon failed in a way the API does
+// not model.
+func (s *ConcreteApiServer) writeError(reqType ApiRequestType, err error, w http.ResponseWriter) {
+	switch {
+	case errors.Is(err, ErrNoSession):
+		w.WriteHeader(http.StatusNoContent)
+	case errors.Is(err, ErrForbidden):
+		w.WriteHeader(http.StatusForbidden)
+	case errors.Is(err, ErrNotFound):
+		w.WriteHeader(http.StatusNotFound)
+	case errors.Is(err, ErrMethodNotAllowed):
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	case errors.Is(err, ErrTooManyRequests):
+		w.WriteHeader(http.StatusTooManyRequests)
+	case errors.Is(err, ErrSuperseded), errors.Is(err, ErrLoaderBusy):
+		w.WriteHeader(http.StatusConflict)
+	case errors.Is(err, ErrBadRequest):
+		w.WriteHeader(http.StatusBadRequest)
+	default:
+		s.log.WithError(err).Errorf("failed handling request %s", reqType)
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+}
+
+func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter) {
+	data, ok := s.dispatch(req, w)
+	if !ok {
+		return
+	}
+
+	switch respData := data.(type) {
 	case []byte:
 		w.Header().Set("Content-Type", "application/octet-stream")
 		_, _ = w.Write(respData)
@@ -629,6 +662,57 @@ func (s *ConcreteApiServer) PlayerOutput(w http.ResponseWriter, r *http.Request)
 	}
 
 	s.handleRequest(ApiRequest{Type: ApiRequestTypeReopenOutput, Data: data.Device}, w)
+}
+
+// PlayerStream is the one handler that does not go through handleRequest. The
+// response is an audio file served with http.ServeContent, which needs the
+// *http.Request to honour Range headers, and writes the body itself rather
+// than JSON-encoding it. So it uses dispatch for the request plumbing and the
+// error mapping, and takes over from there.
+func (s *ConcreteApiServer) PlayerStream(w http.ResponseWriter, r *http.Request, params PlayerStreamParams) {
+	if len(params.Uri) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	// Validate the URI shape early so an obviously-invalid value fails fast
+	// before reaching the daemon.
+	if _, err := librespot.SpotifyIdFromUri(params.Uri); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	bitrate := 0
+	if params.Bitrate != nil {
+		bitrate = *params.Bitrate
+	}
+
+	data, ok := s.dispatch(ApiRequest{
+		Type: ApiRequestTypeStream,
+		Data: ApiStreamData{Uri: params.Uri, Bitrate: bitrate},
+	}, w)
+	if !ok {
+		return
+	}
+
+	resp, ok := data.(*ApiStreamResponse)
+	if !ok || resp.Content == nil {
+		s.log.Errorf("stream request returned unexpected response %T", data)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if closer, ok := resp.Content.(io.Closer); ok {
+		defer func() { _ = closer.Close() }()
+	}
+
+	w.Header().Set("Content-Type", resp.ContentType)
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, resp.Filename))
+
+	// ServeContent handles Range requests and sets Content-Length itself. The
+	// zero modtime suppresses Last-Modified/If-Modified-Since, which mean
+	// nothing for a stream decrypted on the fly.
+	http.ServeContent(w, r, resp.Filename, time.Time{}, resp.Content)
 }
 
 func (s *ConcreteApiServer) GetEvents(w http.ResponseWriter, r *http.Request) {

@@ -708,8 +708,59 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
 			return nil, fmt.Errorf("failed reopening output: %w", err)
 		}
 		return nil, nil
+	case ApiRequestTypeStream:
+		data := req.Data.(ApiStreamData)
+
+		spotId, err := librespot.SpotifyIdFromUri(data.Uri)
+		if err != nil {
+			return nil, fmt.Errorf("invalid uri: %w", err)
+		}
+
+		bitrate := data.Bitrate
+		if bitrate == 0 {
+			bitrate = p.app.cfg.Bitrate
+		}
+
+		// Resolving a stream is metadata lookups, a storage resolve and the
+		// start of a download, and it touches no player state. It goes to its
+		// own goroutine so a caller fetching a file cannot stall playback.
+		// The chunked reader the HTTP handler goes on reading from holds its
+		// own context, so bounding this one covers only the resolve.
+		reply := apiReply(req)
+		p.goDetached(streamResolveTimeout, func(ctx context.Context) {
+			resolved, err := p.player.ResolveDecryptedAudio(ctx, p.app.client, *spotId, bitrate)
+			if err != nil {
+				if errors.Is(err, librespot.ErrMediaRestricted) || errors.Is(err, librespot.ErrNoSupportedFormats) {
+					reply.done(nil, ErrNotFound)
+					return
+				}
+				reply.done(nil, fmt.Errorf("failed resolving audio: %w", err))
+				return
+			}
+
+			reply.done(&ApiStreamResponse{
+				Content:     resolved,
+				ContentType: resolved.ContentType,
+				Filename:    spotId.Base62() + codecExt(resolved.ContentType),
+			}, nil)
+		})
+
+		return nil, errReplyDeferred
 	default:
 		return nil, fmt.Errorf("unknown request type: %s", req.Type)
+	}
+}
+
+func codecExt(contentType string) string {
+	switch contentType {
+	case "audio/ogg":
+		return ".ogg"
+	case "audio/flac":
+		return ".flac"
+	case "audio/mpeg":
+		return ".mp3"
+	default:
+		return ".bin"
 	}
 }
 

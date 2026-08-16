@@ -485,3 +485,8 @@ func (l *loaderLane) close() {
 		l.log.Warn("loader lane did not drain in time")
 	}
 }
+
+// streamResolveTimeout bounds resolving a decrypted audio stream for a
+// /player/stream caller: metadata, storage resolve and the first chunks. The
+// chunked reader served afterwards is not covered by it.
+const streamResolveTimeout = 60 * time.Second
