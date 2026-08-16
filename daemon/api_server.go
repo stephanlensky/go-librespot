@@ -80,6 +80,7 @@ const (
 	ApiRequestTypeToken               ApiRequestType = "token"
 	ApiRequestSetDeviceName           ApiRequestType = "set_device_name"
 	ApiRequestTypeReopenOutput        ApiRequestType = "reopen_output"
+	ApiRequestTypeStream              ApiRequestType = "stream"
 )
 
 type ApiEventType string
@@ -137,6 +138,22 @@ type ApiRequestDataWebApi struct {
 	Method string
 	Path   string
 	Query  url.Values
+}
+
+// ApiStreamData is the request payload for the /player/stream endpoint. It is
+// assembled from query parameters (not a JSON body) so the generated spec
+// describes it as parameters rather than a schema.
+type ApiStreamData struct {
+	Uri     string
+	Bitrate int // 0 selects the daemon's configured bitrate
+}
+
+// ApiStreamResponse carries a decrypted audio stream back to the HTTP handler.
+// It is not JSON-encoded; handleRequest streams it with http.ServeContent.
+type ApiStreamResponse struct {
+	Content     io.ReadSeeker
+	ContentType string
+	Filename    string
 }
 
 type apiResponse struct {
@@ -356,7 +373,7 @@ func (s *StubApiServer) Close() error {
 	return nil
 }
 
-func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter) {
+func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter, r *http.Request) {
 	req.resp = make(chan apiResponse, 1)
 	s.requests <- req
 	resp := <-req.resp
@@ -389,6 +406,18 @@ func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter)
 	}
 
 	switch respData := resp.data.(type) {
+	case *ApiStreamResponse:
+		if respData.Content == nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", respData.ContentType)
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, respData.Filename))
+		http.ServeContent(w, r, respData.Filename, time.Time{}, respData.Content)
+		if closer, ok := respData.Content.(io.Closer); ok {
+			_ = closer.Close()
+		}
 	case []byte:
 		w.Header().Set("Content-Type", "application/octet-stream")
 		_, _ = w.Write(respData)
@@ -418,40 +447,40 @@ func jsonDecode(r *http.Request, v any) error {
 
 var _ ServerInterface = (*ConcreteApiServer)(nil)
 
-func (s *ConcreteApiServer) GetRoot(w http.ResponseWriter, _ *http.Request) {
-	s.handleRequest(ApiRequest{Type: ApiRequestTypeRoot}, w)
+func (s *ConcreteApiServer) GetRoot(w http.ResponseWriter, r *http.Request) {
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeRoot}, w, r)
 }
 
-func (s *ConcreteApiServer) GetStatus(w http.ResponseWriter, _ *http.Request) {
-	s.handleRequest(ApiRequest{Type: ApiRequestTypeStatus}, w)
+func (s *ConcreteApiServer) GetStatus(w http.ResponseWriter, r *http.Request) {
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeStatus}, w, r)
 }
 
-func (s *ConcreteApiServer) GetToken(w http.ResponseWriter, _ *http.Request) {
-	s.handleRequest(ApiRequest{Type: ApiRequestTypeToken}, w)
+func (s *ConcreteApiServer) GetToken(w http.ResponseWriter, r *http.Request) {
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeToken}, w, r)
 }
 
-func (s *ConcreteApiServer) PlayerResume(w http.ResponseWriter, _ *http.Request) {
-	s.handleRequest(ApiRequest{Type: ApiRequestTypeResume}, w)
+func (s *ConcreteApiServer) PlayerResume(w http.ResponseWriter, r *http.Request) {
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeResume}, w, r)
 }
 
-func (s *ConcreteApiServer) PlayerPause(w http.ResponseWriter, _ *http.Request) {
-	s.handleRequest(ApiRequest{Type: ApiRequestTypePause}, w)
+func (s *ConcreteApiServer) PlayerPause(w http.ResponseWriter, r *http.Request) {
+	s.handleRequest(ApiRequest{Type: ApiRequestTypePause}, w, r)
 }
 
-func (s *ConcreteApiServer) PlayerPlayPause(w http.ResponseWriter, _ *http.Request) {
-	s.handleRequest(ApiRequest{Type: ApiRequestTypePlayPause}, w)
+func (s *ConcreteApiServer) PlayerPlayPause(w http.ResponseWriter, r *http.Request) {
+	s.handleRequest(ApiRequest{Type: ApiRequestTypePlayPause}, w, r)
 }
 
-func (s *ConcreteApiServer) PlayerStop(w http.ResponseWriter, _ *http.Request) {
-	s.handleRequest(ApiRequest{Type: ApiRequestTypeStop}, w)
+func (s *ConcreteApiServer) PlayerStop(w http.ResponseWriter, r *http.Request) {
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeStop}, w, r)
 }
 
-func (s *ConcreteApiServer) PlayerPrev(w http.ResponseWriter, _ *http.Request) {
-	s.handleRequest(ApiRequest{Type: ApiRequestTypePrev}, w)
+func (s *ConcreteApiServer) PlayerPrev(w http.ResponseWriter, r *http.Request) {
+	s.handleRequest(ApiRequest{Type: ApiRequestTypePrev}, w, r)
 }
 
-func (s *ConcreteApiServer) PlayerGetVolume(w http.ResponseWriter, _ *http.Request) {
-	s.handleRequest(ApiRequest{Type: ApiRequestTypeGetVolume}, w)
+func (s *ConcreteApiServer) PlayerGetVolume(w http.ResponseWriter, r *http.Request) {
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeGetVolume}, w, r)
 }
 
 func (s *ConcreteApiServer) PlayerPlay(w http.ResponseWriter, r *http.Request) {
@@ -466,7 +495,7 @@ func (s *ConcreteApiServer) PlayerPlay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.handleRequest(ApiRequest{Type: ApiRequestTypePlay, Data: data}, w)
+	s.handleRequest(ApiRequest{Type: ApiRequestTypePlay, Data: data}, w, r)
 }
 
 func (s *ConcreteApiServer) PlayerNext(w http.ResponseWriter, r *http.Request) {
@@ -476,7 +505,7 @@ func (s *ConcreteApiServer) PlayerNext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.handleRequest(ApiRequest{Type: ApiRequestTypeNext, Data: data}, w)
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeNext, Data: data}, w, r)
 }
 
 func (s *ConcreteApiServer) PlayerSeek(w http.ResponseWriter, r *http.Request) {
@@ -491,7 +520,7 @@ func (s *ConcreteApiServer) PlayerSeek(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.handleRequest(ApiRequest{Type: ApiRequestTypeSeek, Data: data}, w)
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeSeek, Data: data}, w, r)
 }
 
 func (s *ConcreteApiServer) PlayerSetVolume(w http.ResponseWriter, r *http.Request) {
@@ -506,7 +535,7 @@ func (s *ConcreteApiServer) PlayerSetVolume(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	s.handleRequest(ApiRequest{Type: ApiRequestTypeSetVolume, Data: data}, w)
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeSetVolume, Data: data}, w, r)
 }
 
 func (s *ConcreteApiServer) PlayerRepeatContext(w http.ResponseWriter, r *http.Request) {
@@ -516,7 +545,7 @@ func (s *ConcreteApiServer) PlayerRepeatContext(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	s.handleRequest(ApiRequest{Type: ApiRequestTypeSetRepeatingContext, Data: data.RepeatContext}, w)
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeSetRepeatingContext, Data: data.RepeatContext}, w, r)
 }
 
 func (s *ConcreteApiServer) PlayerRepeatTrack(w http.ResponseWriter, r *http.Request) {
@@ -526,7 +555,7 @@ func (s *ConcreteApiServer) PlayerRepeatTrack(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	s.handleRequest(ApiRequest{Type: ApiRequestTypeSetRepeatingTrack, Data: data.RepeatTrack}, w)
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeSetRepeatingTrack, Data: data.RepeatTrack}, w, r)
 }
 
 func (s *ConcreteApiServer) PlayerShuffleContext(w http.ResponseWriter, r *http.Request) {
@@ -536,7 +565,7 @@ func (s *ConcreteApiServer) PlayerShuffleContext(w http.ResponseWriter, r *http.
 		return
 	}
 
-	s.handleRequest(ApiRequest{Type: ApiRequestTypeSetShufflingContext, Data: data.ShuffleContext}, w)
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeSetShufflingContext, Data: data.ShuffleContext}, w, r)
 }
 
 func (s *ConcreteApiServer) PlayerAddToQueue(w http.ResponseWriter, r *http.Request) {
@@ -551,7 +580,7 @@ func (s *ConcreteApiServer) PlayerAddToQueue(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	s.handleRequest(ApiRequest{Type: ApiRequestTypeAddToQueue, Data: data.Uri}, w)
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeAddToQueue, Data: data.Uri}, w, r)
 }
 
 func (s *ConcreteApiServer) SetDeviceName(w http.ResponseWriter, r *http.Request) {
@@ -566,7 +595,7 @@ func (s *ConcreteApiServer) SetDeviceName(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	s.handleRequest(ApiRequest{Type: ApiRequestSetDeviceName, Data: data.Name}, w)
+	s.handleRequest(ApiRequest{Type: ApiRequestSetDeviceName, Data: data.Name}, w, r)
 }
 
 func (s *ConcreteApiServer) PlayerOutput(w http.ResponseWriter, r *http.Request) {
@@ -576,7 +605,31 @@ func (s *ConcreteApiServer) PlayerOutput(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	s.handleRequest(ApiRequest{Type: ApiRequestTypeReopenOutput, Data: data.Device}, w)
+	s.handleRequest(ApiRequest{Type: ApiRequestTypeReopenOutput, Data: data.Device}, w, r)
+}
+
+func (s *ConcreteApiServer) PlayerStream(w http.ResponseWriter, r *http.Request, params PlayerStreamParams) {
+	if len(params.Uri) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	// Validate the URI shape early so an obviously-invalid value fails fast
+	// before reaching the daemon.
+	if _, err := librespot.SpotifyIdFromUri(params.Uri); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	bitrate := 0
+	if params.Bitrate != nil {
+		bitrate = *params.Bitrate
+	}
+
+	s.handleRequest(ApiRequest{
+		Type: ApiRequestTypeStream,
+		Data: ApiStreamData{Uri: params.Uri, Bitrate: bitrate},
+	}, w, r)
 }
 
 // handleWebApi proxies anything under /web-api/ to the Spotify Web API. It is
@@ -590,7 +643,7 @@ func (s *ConcreteApiServer) handleWebApi(w http.ResponseWriter, r *http.Request)
 			Path:   strings.TrimPrefix(r.URL.Path, "/web-api/"),
 			Query:  r.URL.Query(),
 		},
-	}, w)
+	}, w, r)
 }
 
 func (s *ConcreteApiServer) GetEvents(w http.ResponseWriter, r *http.Request) {

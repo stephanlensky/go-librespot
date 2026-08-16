@@ -8,6 +8,8 @@ package daemon
 import (
 	"fmt"
 	"net/http"
+
+	"github.com/oapi-codegen/runtime"
 )
 
 // Defines values for TrackCodec.
@@ -210,6 +212,15 @@ type ApiVolume struct {
 	Value uint32 `json:"value"`
 }
 
+// PlayerStreamParams defines parameters for PlayerStream.
+type PlayerStreamParams struct {
+	// Uri Spotify track or episode URI, for example spotify:track:4iV5W9uYEdYUVa79Axb7Rh
+	Uri string `form:"uri" json:"uri"`
+
+	// Bitrate Preferred bitrate in kbps. When omitted the daemon's configured bitrate is used.
+	Bitrate *int `form:"bitrate,omitempty" json:"bitrate,omitempty"`
+}
+
 // PlayerAddToQueueJSONRequestBody defines body for PlayerAddToQueue for application/json ContentType.
 type PlayerAddToQueueJSONRequestBody = ApiAddToQueue
 
@@ -287,6 +298,9 @@ type ServerInterface interface {
 
 	// (POST /player/stop)
 	PlayerStop(w http.ResponseWriter, r *http.Request)
+
+	// (GET /player/stream)
+	PlayerStream(w http.ResponseWriter, r *http.Request, params PlayerStreamParams)
 
 	// (GET /player/volume)
 	PlayerGetVolume(w http.ResponseWriter, r *http.Request)
@@ -523,6 +537,48 @@ func (siw *ServerInterfaceWrapper) PlayerStop(w http.ResponseWriter, r *http.Req
 	handler.ServeHTTP(w, r)
 }
 
+// PlayerStream operation middleware
+func (siw *ServerInterfaceWrapper) PlayerStream(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params PlayerStreamParams
+
+	// ------------- Required query parameter "uri" -------------
+
+	if paramValue := r.URL.Query().Get("uri"); paramValue != "" {
+
+	} else {
+		siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "uri"})
+		return
+	}
+
+	err = runtime.BindQueryParameter("form", true, true, "uri", r.URL.Query(), &params.Uri)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "uri", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "bitrate" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "bitrate", r.URL.Query(), &params.Bitrate)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "bitrate", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PlayerStream(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // PlayerGetVolume operation middleware
 func (siw *ServerInterfaceWrapper) PlayerGetVolume(w http.ResponseWriter, r *http.Request) {
 
@@ -728,6 +784,7 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc("POST "+options.BaseURL+"/player/seek", wrapper.PlayerSeek)
 	m.HandleFunc("POST "+options.BaseURL+"/player/shuffle_context", wrapper.PlayerShuffleContext)
 	m.HandleFunc("POST "+options.BaseURL+"/player/stop", wrapper.PlayerStop)
+	m.HandleFunc("GET "+options.BaseURL+"/player/stream", wrapper.PlayerStream)
 	m.HandleFunc("GET "+options.BaseURL+"/player/volume", wrapper.PlayerGetVolume)
 	m.HandleFunc("POST "+options.BaseURL+"/player/volume", wrapper.PlayerSetVolume)
 	m.HandleFunc("POST "+options.BaseURL+"/set_device_name", wrapper.SetDeviceName)

@@ -1,6 +1,7 @@
 package player
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -732,6 +733,233 @@ func (p *Player) getUnrestrictedTrack(ctx context.Context, spotId librespot.Spot
 
 	// We tried all alternatives, still restricted
 	return nil, librespot.ErrMediaRestricted
+}
+
+// ResolvedAudio holds a decrypted but still encoded audio file for delivery
+// over the API: the bytes after AES decryption, still in the original OGG
+// Vorbis, FLAC or MP3 encoding. It stops short of the codec decode NewStream
+// performs, so it can be streamed to a client unchanged.
+type ResolvedAudio struct {
+	io.ReadSeeker
+	Size        int64
+	ContentType string
+	FormatName  string
+	Media       *librespot.Media
+
+	closeFn func() error
+}
+
+func (r *ResolvedAudio) Close() error {
+	if r.closeFn == nil {
+		return nil
+	}
+	return r.closeFn()
+}
+
+// ResolveDecryptedAudio fetches and decrypts the best audio file for a track or
+// episode, returning the still-encoded bytes (OGG/FLAC/MP3) ready to stream.
+// It mirrors the first half of NewStream — metadata, format selection, key
+// retrieval, download and decryption — but stops before codec decoding.
+func (p *Player) ResolveDecryptedAudio(ctx context.Context, client *http.Client, spotId librespot.SpotifyId, bitrate int) (*ResolvedAudio, error) {
+	var media *librespot.Media
+	var file *metadatapb.AudioFile
+	if spotId.Type() == librespot.SpotifyIdTypeTrack {
+		trackMeta, err := p.getUnrestrictedTrack(ctx, spotId)
+		if err != nil {
+			return nil, err
+		}
+
+		media = librespot.NewMediaFromTrack(trackMeta)
+		spotId = media.Id()
+
+		var audioFilesResp audiofilespb.AudioFilesExtensionResponse
+		err = p.sp.ExtendedMetadataSimple(ctx, spotId, extmetadatapb.ExtensionKind_AUDIO_FILES, &audioFilesResp)
+		if err != nil {
+			return nil, fmt.Errorf("failed getting audio files metadata: %w", err)
+		}
+
+		var audioFiles []*metadatapb.AudioFile
+		for _, f := range audioFilesResp.Files {
+			audioFiles = append(audioFiles, f.File)
+		}
+
+		file = selectBestMediaFormat(audioFiles, bitrate, p.flacEnabled)
+		if file == nil {
+			return nil, librespot.ErrNoSupportedFormats
+		}
+	} else if spotId.Type() == librespot.SpotifyIdTypeEpisode {
+		var episodeMeta metadatapb.Episode
+		err := p.sp.ExtendedMetadataSimple(ctx, spotId, extmetadatapb.ExtensionKind_EPISODE_V4, &episodeMeta)
+		if err != nil {
+			return nil, fmt.Errorf("failed getting episode metadata: %w", err)
+		}
+
+		media = librespot.NewMediaFromEpisode(&episodeMeta)
+		if isMediaRestricted(media, *p.countryCode) {
+			return nil, librespot.ErrMediaRestricted
+		}
+
+		file = selectBestMediaFormat(episodeMeta.Audio, bitrate, p.flacEnabled)
+		if file == nil {
+			return nil, librespot.ErrNoSupportedFormats
+		}
+	} else {
+		return nil, fmt.Errorf("unsupported spotify type: %s", spotId.Type())
+	}
+
+	audioKey, err := p.retrieveAudioKey(ctx, spotId, file.FileId)
+	if err != nil {
+		return nil, fmt.Errorf("failed retrieving audio key: %w", err)
+	}
+
+	// Prefer a cached copy of the encrypted audio file when available, mirroring
+	// NewStream; the audio key is still required to decrypt it.
+	var rawStream librespot.SizedReadAtSeeker
+	if p.cache != nil {
+		if cached, ok := p.cache.File(file.FileId); ok {
+			rawStream = cached
+		}
+	}
+
+	if rawStream == nil {
+		storageResolve, err := p.sp.ResolveStorageInteractive(ctx, file.FileId, file.Format, false)
+		if err != nil {
+			return nil, fmt.Errorf("failed resolving track storage: %w", err)
+		}
+
+		httpStream, err := p.httpChunkedReaderFromStorageResolve(p.log, client, storageResolve)
+		if err != nil {
+			return nil, fmt.Errorf("failed creating chunked reader: %w", err)
+		}
+
+		// Persist the encrypted file to the cache once it has been fully
+		// downloaded, best-effort like NewStream.
+		if p.cache != nil {
+			fileId := file.FileId
+			httpStream.OnComplete(func(r io.ReaderAt, size int64) {
+				if err := p.cache.SaveFile(fileId, io.NewSectionReader(r, 0, size)); err != nil {
+					p.log.WithError(err).Warnf("failed caching audio file")
+				}
+			})
+		}
+
+		rawStream = httpStream
+	}
+
+	decryptedStream, err := audio.NewAesAudioDecryptor(rawStream, audioKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed initializing audio decryptor: %w", err)
+	}
+
+	contentType, formatName := audioFormatContentType(*file.Format)
+
+	// OGG Vorbis streams from Spotify carry a custom metadata page at the
+	// start (seek table, replay gain) in place of the standard Vorbis
+	// identification header. Strip it so downstream players see a valid
+	// Ogg Vorbis bitstream. Also trim any trailing non-Ogg bytes (CDN
+	// padding that remains after AES decryption), otherwise tools like
+	// mutagen fail to re-save the file after tagging.
+	var rdr io.ReadSeeker
+	var size int64
+	if GetAudioFileFormatAudioFormat(*file.Format) == AudioFormatOGGVorbis {
+		audioStream, _, err := vorbis.ExtractMetadataPage(p.log, decryptedStream, rawStream.Size())
+		if err != nil {
+			return nil, fmt.Errorf("failed extracting Ogg metadata page: %w", err)
+		}
+
+		// audioStream spans [firstPageEnd, rawStream.Size()). Determine the
+		// real end of the last Ogg page so trailing padding is excluded.
+		firstPageEnd := rawStream.Size() - audioStream.Size()
+		lastPageEnd := findLastOggPageEnd(decryptedStream, rawStream.Size())
+		if lastPageEnd <= firstPageEnd {
+			lastPageEnd = rawStream.Size()
+		}
+
+		contentSize := lastPageEnd - firstPageEnd
+		rdr = io.NewSectionReader(decryptedStream, firstPageEnd, contentSize)
+		size = contentSize
+	} else {
+		sr := io.NewSectionReader(decryptedStream, 0, rawStream.Size())
+		rdr = sr
+		size = sr.Size()
+	}
+
+	return &ResolvedAudio{
+		ReadSeeker:  rdr,
+		Size:        size,
+		ContentType: contentType,
+		FormatName:  formatName,
+		Media:       media,
+		closeFn:     decryptedStream.Close,
+	}, nil
+}
+
+// findLastOggPageEnd reads the tail of r (up to totalSize) to locate the final
+// Ogg page boundary. Returns the byte offset immediately after the last
+// complete page, or 0 if no valid page was found. The window is sized above
+// the maximum possible Ogg page size (255 lacing values of 255 bytes each
+// plus header, ~65307 bytes) so the last page header always fits.
+func findLastOggPageEnd(r io.ReaderAt, totalSize int64) int64 {
+	const window = 66 * 1024
+	off := max(0, totalSize-window)
+	buf := make([]byte, totalSize-off)
+	if _, err := r.ReadAt(buf, off); err != nil && err != io.EOF {
+		return 0
+	}
+
+	// Search backwards for the "OggS" magic in the window.
+	searchEnd := len(buf)
+	for {
+		idx := bytes.LastIndex(buf[:searchEnd], []byte("OggS"))
+		if idx < 0 {
+			return 0
+		}
+		pos := off + int64(idx)
+		searchEnd = idx // keep searching if this page header is truncated
+
+		// Read the full page header (27 bytes) from the position.
+		hdr := make([]byte, 27)
+		if _, err := r.ReadAt(hdr, pos); err != nil {
+			continue
+		}
+
+		segments := int(hdr[26])
+		pageSize := int64(27 + segments)
+		if pageSize > totalSize-pos {
+			// Page header says more segments than fit: truncated, try earlier.
+			continue
+		}
+
+		// Read the segment table.
+		segTable := make([]byte, segments)
+		if _, err := r.ReadAt(segTable, pos+27); err != nil {
+			continue
+		}
+
+		for _, s := range segTable {
+			pageSize += int64(s)
+		}
+
+		if pageSize > totalSize-pos {
+			continue
+		}
+
+		return pos + pageSize
+	}
+}
+
+func audioFormatContentType(format metadatapb.AudioFile_Format) (contentType, formatName string) {
+	formatName = format.String()
+	switch GetAudioFileFormatAudioFormat(format) {
+	case AudioFormatOGGVorbis:
+		return "audio/ogg", formatName
+	case AudioFormatFLAC:
+		return "audio/flac", formatName
+	case AudioFormatMP3:
+		return "audio/mpeg", formatName
+	default:
+		return "application/octet-stream", formatName
+	}
 }
 
 func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId librespot.SpotifyId, bitrate int, mediaPosition int64) (*Stream, error) {

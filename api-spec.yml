@@ -634,3 +634,41 @@ paths:
           description: Successful response
         400:
           description: The uri is missing or empty
+  /player/stream:
+    get:
+      operationId: playerStream
+      description: >-
+        Get a decrypted audio stream for a track or episode URI. The audio is
+        AES-decrypted but still in its original encoded format (OGG Vorbis,
+        FLAC, or MP3) — it is not decoded to PCM. Supports HTTP range requests.
+      parameters:
+        - name: uri
+          in: query
+          required: true
+          description: >-
+            Spotify track or episode URI, for example
+            spotify:track:4iV5W9uYEdYUVa79Axb7Rh
+          schema:
+            type: string
+        - name: bitrate
+          in: query
+          required: false
+          description: >-
+            Preferred bitrate in kbps. When omitted the daemon's configured
+            bitrate is used.
+          schema:
+            type: integer
+      responses:
+        200:
+          description: The decrypted audio stream
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        400:
+          description: The `uri` query parameter is missing, empty, or invalid
+        404:
+          description: The track could not be found or is not playable
+        500:
+          description: Failed to resolve or decrypt the audio

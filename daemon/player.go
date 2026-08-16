@@ -712,8 +712,47 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 			return nil, fmt.Errorf("failed reopening output: %w", err)
 		}
 		return nil, nil
+	case ApiRequestTypeStream:
+		data := req.Data.(ApiStreamData)
+
+		spotId, err := librespot.SpotifyIdFromUri(data.Uri)
+		if err != nil {
+			return nil, fmt.Errorf("invalid uri: %w", err)
+		}
+
+		bitrate := data.Bitrate
+		if bitrate == 0 {
+			bitrate = p.app.cfg.Bitrate
+		}
+
+		resolved, err := p.player.ResolveDecryptedAudio(ctx, p.app.client, *spotId, bitrate)
+		if err != nil {
+			if errors.Is(err, librespot.ErrMediaRestricted) || errors.Is(err, librespot.ErrNoSupportedFormats) {
+				return nil, ErrNotFound
+			}
+			return nil, fmt.Errorf("failed resolving audio: %w", err)
+		}
+
+		return &ApiStreamResponse{
+			Content:     resolved,
+			ContentType: resolved.ContentType,
+			Filename:    spotId.Base62() + codecExt(resolved.ContentType),
+		}, nil
 	default:
 		return nil, fmt.Errorf("unknown request type: %s", req.Type)
+	}
+}
+
+func codecExt(contentType string) string {
+	switch contentType {
+	case "audio/ogg":
+		return ".ogg"
+	case "audio/flac":
+		return ".flac"
+	case "audio/mpeg":
+		return ".mp3"
+	default:
+		return ".bin"
 	}
 }
 

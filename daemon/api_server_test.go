@@ -143,6 +143,7 @@ var endpointMethods = map[string][]string{
 	"/player/shuffle_context": {http.MethodPost},
 	"/player/add_to_queue":    {http.MethodPost},
 	"/player/output":          {http.MethodPost},
+	"/player/stream":          {http.MethodGet},
 }
 
 func TestApiRejectsWrongMethod(t *testing.T) {
@@ -620,6 +621,52 @@ func TestApiWrappedErrorsMapToStatusCodes(t *testing.T) {
 
 	resp := ts.do(http.MethodGet, "/status", nil)
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+func TestApiStream(t *testing.T) {
+	t.Run("streams decrypted audio with content type and disposition", func(t *testing.T) {
+		ts := newTestServer(t, func(req ApiRequest) (any, error) {
+			require.Equal(t, ApiRequestTypeStream, req.Type)
+			require.Equal(t, ApiStreamData{Uri: "spotify:track:4iV5W9uYEdYUVa79Axb7Rh", Bitrate: 320}, req.Data)
+			return &ApiStreamResponse{
+				Content:     bytes.NewReader([]byte("decrypted audio bytes")),
+				ContentType: "audio/ogg",
+				Filename:    "track.ogg",
+			}, nil
+		})
+
+		resp := ts.do(http.MethodGet, "/player/stream?uri=spotify:track:4iV5W9uYEdYUVa79Axb7Rh&bitrate=320", nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Equal(t, "audio/ogg", resp.Header.Get("Content-Type"))
+		require.Contains(t, resp.Header.Get("Content-Disposition"), `filename="track.ogg"`)
+		require.Equal(t, "decrypted audio bytes", body(t, resp))
+	})
+
+	t.Run("defaults bitrate to zero", func(t *testing.T) {
+		ts := newTestServer(t, func(req ApiRequest) (any, error) {
+			require.EqualValues(t, 0, req.Data.(ApiStreamData).Bitrate)
+			return &ApiStreamResponse{Content: bytes.NewReader(nil), ContentType: "audio/ogg", Filename: "t.ogg"}, nil
+		})
+
+		resp := ts.do(http.MethodGet, "/player/stream?uri=spotify:track:4iV5W9uYEdYUVa79Axb7Rh", nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+	})
+
+	t.Run("rejects a missing uri", func(t *testing.T) {
+		ts := newTestServer(t, okReply)
+
+		resp := ts.do(http.MethodGet, "/player/stream", nil)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		ts.requireNoRequest()
+	})
+
+	t.Run("rejects an invalid uri", func(t *testing.T) {
+		ts := newTestServer(t, okReply)
+
+		resp := ts.do(http.MethodGet, "/player/stream?uri=not-a-uri", nil)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		ts.requireNoRequest()
+	})
 }
 
 func TestApiUnknownPathIsNotFound(t *testing.T) {
